@@ -1,262 +1,318 @@
-﻿#include "E:\git_work\Computer_Graphics_Course\rgz\GL\glut.h"
+#include "GL/glut.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
-#include <array>
 
+// ====== ТИПЫ ПАРАМЕТРИЗАЦИИ ======
+enum ParamType { UNIFORM, CHORD, CENTRIPETAL };
+ParamType paramMode = CHORD;
+const char* paramNames[] = {"Uniform (t=i)", "Chord Length", "Centripetal"};
 
+// ====== ТИПЫ СПЛАЙНОВ ======
+enum SplineType { NATURAL, CLAMPED };
+SplineType splineMode = NATURAL;
+const char* splineNames[] = {"Natural Cubic", "Clamped Cubic"};
 
-// ====== Константы ======
-const double POINT_GRAB_RADIUS = 0.5;
-const int MIN_POINTS = 4; // Для сплайна Лагранжа 3-й степени нужно минимум 4 точки
-const double LABEL_BASE_HEIGHT = 0.25;
-const double TEXT_DEFAULT_HEIGHT = 119.05;
+// ====== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======
+int winW = 1024, winH = 768;
+double mx = 0.0, my = 0.0;
+int activePoint = -1, hoverPoint = -1;
+bool mouseDown = false;
 
-// ====== Глобальные переменные ======
-int windowWidth = 800, windowHeight = 600;
-struct Point {
-    double x, y;
-    Point(double x = 0, double y = 0) : x(x), y(y) {}
-};
-std::vector<Point> points;
-int moving_point = -1;
-int hover_point = -1;
-Point mouseWorld;
-Point cameraPos = { 0.0, 0.0 };
-Point cameraSize = { 10.0, 10.0 };
-double step = 0.01;
-double label_step = 1.0;
+struct Point { double x, y; };
+std::vector<Point> points;  // контрольные точки (x_i, y_i)
 
-// ====== Полином Лагранжа 3-й степени по 4 точкам ======
-double lagrange3(double x, const std::array<Point, 4>& pts) {
-    double L = 0.0;
-    for (int i = 0; i < 4; ++i) {
-        double term = pts[i].y;
-        for (int j = 0; j < 4; ++j) {
-            if (i != j) {
-                double denom = pts[i].x - pts[j].x;
-                if (std::abs(denom) < 1e-12) return 0.0;
-                term *= (x - pts[j].x) / denom;
-            }
-        }
-        L += term;
+// Параметрические узлы и коэффициенты сплайнов
+std::vector<double> t_param;  // параметр t_i для каждой точки
+std::vector<double> Mx, My;   // вторые производные для X(t) и Y(t)
+bool dirty = true;
+
+struct View { double x0, x1, y0, y1; } view = {-6.0, 6.0, -4.5, 4.5};
+
+// ====== МАТЕМАТИКА ======
+
+void solveTridiagonal(double* a, double* b, double* c, double* d, double* x, size_t n) {
+    if (n == 0) return;
+    for (size_t i = 1; i < n; ++i) {
+        double w = a[i] / b[i-1];
+        b[i] -= w * c[i-1];
+        d[i] -= w * d[i-1];
     }
-    return L;
+    x[n-1] = d[n-1] / b[n-1];
+    for (int i = (int)n - 2; i >= 0; --i)
+        x[i] = (d[i] - c[i] * x[i+1]) / b[i];
 }
 
-double lagrange3Derivative(double x, const std::array<Point, 4>& pts) {
-    double dL = 0.0;
-    for (int i = 0; i < 4; ++i) {
-        double sum = 0.0;
-        for (int k = 0; k < 4; ++k) {
-            if (k == i) continue;
-            double prod = 1.0;
-            for (int j = 0; j < 4; ++j) {
-                if (j == i || j == k) continue;
-                double denom = pts[i].x - pts[j].x;
-                if (std::abs(denom) < 1e-12) return 0.0;
-                prod *= (x - pts[j].x) / denom;
-            }
-            double denom = pts[i].x - pts[k].x;
-            if (std::abs(denom) < 1e-12) return 0.0;
-            sum += prod / denom;
-        }
-        dL += pts[i].y * sum;
-    }
-    return dL;
-}
-
-// ====== Вспомогательные функции ======
-bool canGrab(const Point& p) {
-    double dx = mouseWorld.x - p.x;
-    double dy = mouseWorld.y - p.y;
-    return std::sqrt(dx * dx + dy * dy) <= POINT_GRAB_RADIUS;
-}
-
-bool canAdd(const Point& p1, const Point& p2) {
-    double dx = p1.x - p2.x;
-    double dy = p1.y - p2.y;
-    return std::sqrt(dx * dx + dy * dy) > 2 * POINT_GRAB_RADIUS;
-}
-
-void updateMouseWorld(int x, int y) {
-    double aspect = (double)windowWidth / windowHeight;
-    cameraSize.x = cameraSize.y * aspect;
-    mouseWorld.x = (double)x / windowWidth * (2 * cameraSize.x) - cameraSize.x + cameraPos.x;
-    mouseWorld.y = (1.0 - (double)y / windowHeight) * (2 * cameraSize.y) - cameraSize.y + cameraPos.y;
-}
-
-void calcCamera() {
-    if (cameraSize.y > 100.0) cameraSize.y = 100.0;
-    if (cameraSize.y < 0.1) cameraSize.y = 0.1;
-    double aspect = (double)windowWidth / windowHeight;
-    cameraSize.x = cameraSize.y * aspect;
-
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(cameraPos.x - cameraSize.x, cameraPos.x + cameraSize.x,
-        cameraPos.y - cameraSize.y, cameraPos.y + cameraSize.y,
-        -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-
-    step = cameraSize.x / windowWidth;
-    label_step = 100.0 * cameraSize.x / windowWidth;
-    double log_step = std::floor(std::log10(label_step));
-    double mantissa = label_step / std::pow(10.0, log_step);
-    if (mantissa < 1.5) mantissa = 1.0;
-    else if (mantissa < 3.0) mantissa = 2.0;
-    else if (mantissa < 7.0) mantissa = 5.0;
-    else mantissa = 10.0;
-    label_step = mantissa * std::pow(10.0, log_step);
-}
-
-void updateWindowTitle() {
-    char title[256];
-    bool duplicateX = false;
-    for (size_t i = 0; i + 1 < points.size(); ++i) {
-        if (std::abs(points[i].x - points[i + 1].x) < 1e-9) {
-            duplicateX = true;
-            snprintf(title, sizeof(title), "КГ Лаб 4 | Ошибка: несколько точек в одном x! (%.2f)", points[i].x);
+void computeParameters() {
+    size_t n = points.size();
+    t_param.resize(n);
+    if (n == 0) return;
+    
+    t_param[0] = 0.0;
+    
+    switch (paramMode) {
+        case UNIFORM:
+            for (size_t i = 1; i < n; ++i)
+                t_param[i] = (double)i;
             break;
-        }
-    }
-    if (!duplicateX) {
-        if ((int)points.size() < MIN_POINTS) {
-            snprintf(title, sizeof(title), "КГ Лаб 4 | Недостаточно точек! (%d / %d)", (int)points.size(), MIN_POINTS);
-        }
-        else {
-            snprintf(title, sizeof(title), "КГ Лаб 4 | Точек: %d; красным - сплайн, синим - производная", (int)points.size());
-        }
-    }
-    glutSetWindowTitle(title);
-}
-
-void renderText(double x, double y, double height, const char* text) {
-    double scale = height / TEXT_DEFAULT_HEIGHT;
-    glPushMatrix();
-    glTranslated(x, y - height, 0.0);
-    glScaled(scale, scale, 1.0);
-    for (const char* c = text; *c != '\0'; ++c) {
-        glutStrokeCharacter(GLUT_STROKE_ROMAN, *c);
-    }
-    glPopMatrix();
-}
-
-// ====== Обработчики меню ======
-void menuCallback(int value) {
-    switch (value) {
-    case 1: // Добавить точку
-        if (canAdd(Point(), mouseWorld)) {
-            bool tooClose = false;
-            for (const auto& p : points) {
-                if (!canAdd(p, mouseWorld)) {
-                    tooClose = true;
-                    break;
-                }
+            
+        case CHORD:
+            for (size_t i = 1; i < n; ++i) {
+                double dx = points[i].x - points[i-1].x;
+                double dy = points[i].y - points[i-1].y;
+                t_param[i] = t_param[i-1] + std::sqrt(dx*dx + dy*dy);
             }
-            if (!tooClose) {
-                points.push_back(mouseWorld);
-                std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-                    return a.x < b.x;
-                    });
+            break;
+            
+        case CENTRIPETAL:
+            for (size_t i = 1; i < n; ++i) {
+                double dx = points[i].x - points[i-1].x;
+                double dy = points[i].y - points[i-1].y;
+                t_param[i] = t_param[i-1] + std::sqrt(std::sqrt(dx*dx + dy*dy));
             }
-        }
-        break;
-    case 2: // Удалить точку под курсором
-        for (size_t i = 0; i < points.size(); ++i) {
-            if (canGrab(points[i])) {
-                points.erase(points.begin() + i);
-                break;
-            }
-        }
-        break;
-    case 3: // Очистить все
-        points.clear();
-        break;
-    case 10: cameraPos.y += 1.0; break;
-    case 11: cameraPos.y -= 1.0; break;
-    case 12: cameraPos.x -= 1.0; break;
-    case 13: cameraPos.x += 1.0; break;
-    case 14: cameraSize.y *= 1.2; break; // Отдалить
-    case 15: cameraSize.y *= 0.8; break; // Приблизить
+            break;
     }
-    calcCamera();
-    glutPostRedisplay();
+    
+    // Нормировка в [0, 1] для численной устойчивости
+    double total = t_param[n-1];
+    if (total > 1e-6)
+        for (size_t i = 0; i < n; ++i) t_param[i] /= total;
 }
 
-void createMenu() {
-    int cameraMenu = glutCreateMenu(menuCallback);
-    glutAddMenuEntry("Сдвиг вверх", 10);
-    glutAddMenuEntry("Сдвиг вниз", 11);
-    glutAddMenuEntry("Сдвиг влево", 12);
-    glutAddMenuEntry("Сдвиг вправо", 13);
-    glutAddMenuEntry("Отдалить", 14);
-    glutAddMenuEntry("Приблизить", 15);
-
-    int mainMenu = glutCreateMenu(menuCallback);
-    glutAddSubMenu("Область отображения", cameraMenu);
-    glutAddMenuEntry("Добавить точку", 1);
-    glutAddMenuEntry("Удалить точку под курсором", 2);
-    glutAddMenuEntry("Очистить", 3);
-
-    glutAttachMenu(GLUT_RIGHT_BUTTON);
+void buildSplineComponent(const std::vector<double>& t,
+                          const std::vector<double>& f,
+                          std::vector<double>& M) {
+    size_t n = t.size();
+    M.assign(n, 0.0);
+    if (n < 2) return;
+    
+    if (n == 2) return; // M[0] = M[1] = 0 для одного сегмента
+    
+    size_t m = n - 2;
+    std::vector<double> a(m), b(m), c(m), d(m);
+    
+    for (size_t i = 0; i < m; ++i) {
+        double h_i = t[i+1] - t[i];
+        double h_ip1 = t[i+2] - t[i+1];
+        a[i] = h_i / 6.0;
+        b[i] = (h_i + h_ip1) / 3.0;
+        c[i] = h_ip1 / 6.0;
+        double df_ip1 = (f[i+2] - f[i+1]) / h_ip1;
+        double df_i = (f[i+1] - f[i]) / h_i;
+        d[i] = df_ip1 - df_i;
+    }
+    
+    if (splineMode == CLAMPED && n > 2) {
+        double h0 = t[1] - t[0];
+        double hn = t[n-1] - t[n-2];
+        double f0_prime = (f[1] - f[0]) / h0;
+        double fn_prime = (f[n-1] - f[n-2]) / hn;
+        d[0] -= a[0] * (6.0 / h0) * ((f[1] - f[0]) / h0 - f0_prime);
+        d[m-1] -= c[m-1] * (6.0 / hn) * (fn_prime - (f[n-1] - f[n-2]) / hn);
+    }
+    
+    std::vector<double> M_inner(m);
+    solveTridiagonal(a.data(), b.data(), c.data(), d.data(), M_inner.data(), m);
+    for (size_t i = 0; i < m; ++i) M[i+1] = M_inner[i];
+    
+    // Граничные условия
+    M[0] = (splineMode == NATURAL) ? 0.0 : 0.0; // Для простоты оставляем 0
+    M[n-1] = (splineMode == NATURAL) ? 0.0 : 0.0;
 }
 
-// ====== Callbacks ======
+void buildSplines() {
+    if (points.size() < 2) { dirty = false; return; }
+    
+    computeParameters();
+    
+    std::vector<double> fx(points.size()), fy(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        fx[i] = points[i].x;
+        fy[i] = points[i].y;
+    }
+    
+    buildSplineComponent(t_param, fx, Mx);
+    buildSplineComponent(t_param, fy, My);
+    
+    dirty = false;
+}
+
+Point evaluate(double t) {
+    if (points.size() < 2) return {0, 0};
+    
+    // Найти сегмент
+    size_t i = 0;
+    while (i + 1 < t_param.size() && t > t_param[i+1] + 1e-9) i++;
+    
+    double ti = t_param[i], tip1 = t_param[i+1];
+    double h = tip1 - ti;
+    if (h < 1e-9) return points[i];
+    
+    double u = (t - ti) / h;
+    double A = 1.0 - u;
+    double B = u;
+    double h2_6 = (h * h) / 6.0;
+    
+    double x = A * points[i].x + B * points[i+1].x +
+               ((A*A*A - A) * Mx[i] + (B*B*B - B) * Mx[i+1]) * h2_6;
+    double y = A * points[i].y + B * points[i+1].y +
+               ((A*A*A - A) * My[i] + (B*B*B - B) * My[i+1]) * h2_6;
+    
+    return {x, y};
+}
+
+// ====== ОТРИСОВКА ======
+
+void drawGrid() {
+    glColor3f(0.93f, 0.93f, 0.93f);
+    glBegin(GL_LINES);
+    for (double x = std::floor(view.x0); x <= std::ceil(view.x1); ++x) {
+        glVertex2d(x, view.y0); glVertex2d(x, view.y1);
+    }
+    for (double y = std::floor(view.y0); y <= std::ceil(view.y1); ++y) {
+        glVertex2d(view.x0, y); glVertex2d(view.x1, y);
+    }
+    glEnd();
+    
+    glColor3f(0.4f, 0.4f, 0.4f);
+    glLineWidth(1.8f);
+    glBegin(GL_LINES);
+    glVertex2d(view.x0, 0.0); glVertex2d(view.x1, 0.0);
+    glVertex2d(0.0, view.y0); glVertex2d(0.0, view.y1);
+    glEnd();
+}
+
+void drawSpline() {
+    if (points.size() < 2) return;
+    if (dirty) buildSplines();
+    
+    glColor3f(0.15f, 0.55f, 0.95f);
+    glLineWidth(2.4f);
+    glBegin(GL_LINE_STRIP);
+    const int steps = 300;
+    for (int i = 0; i <= steps; ++i) {
+        double t = (double)i / steps;
+        Point p = evaluate(t);
+        glVertex2d(p.x, p.y);
+    }
+    glEnd();
+}
+
+void drawPoints() {
+    glPointSize(9.0f);
+    glBegin(GL_POINTS);
+    for (size_t i = 0; i < points.size(); ++i) {
+        if ((int)i == activePoint) glColor3f(0.95f, 0.3f, 0.25f);
+        else if ((int)i == hoverPoint) glColor3f(0.2f, 0.65f, 1.0f);
+        else glColor3f(0.15f, 0.5f, 0.9f);
+        glVertex2d(points[i].x, points[i].y);
+    }
+    glEnd();
+    
+    // Нумерация точек
+    glColor3f(0.2f, 0.2f, 0.2f);
+    for (size_t i = 0; i < points.size(); ++i) {
+        char buf[8]; snprintf(buf, sizeof(buf), "%zu", i);
+        glRasterPos2d(points[i].x + 0.15, points[i].y + 0.15);
+        for (char* p = buf; *p; ++p) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_10, *p);
+    }
+}
+
+void drawUI() {
+    glColor4f(0.99f, 0.99f, 0.99f, 0.93f);
+    glBegin(GL_QUADS);
+    glVertex2i(0, 0); glVertex2i(winW, 0);
+    glVertex2i(winW, 34); glVertex2i(0, 34);
+    glEnd();
+    
+    glColor3f(0.22f, 0.22f, 0.22f);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "1D Parametric Splines | Points: %zu | Param: %s | Spline: %s | [1-3] Param | [4-5] Spline | [C] Clear | [R] Reset",
+             points.size(), paramNames[(int)paramMode], splineNames[(int)splineMode]);
+    
+    glRasterPos2i(12, 21);
+    for (char* p = buf; *p; ++p) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_10, *p);
+}
+
+// ====== ВЗАИМОДЕЙСТВИЕ ======
+
+bool canGrab(const Point& p, double x, double y) {
+    double dx = x - p.x;
+    double dy = y - p.y;
+    double r = 0.18 * std::max(1.0, (view.x1 - view.x0) / 12.0);
+    return (dx*dx + dy*dy) <= r*r;
+}
+
+void screenToWorld(int x, int y, double& wx, double& wy) {
+    wx = view.x0 + (x / (double)winW) * (view.x1 - view.x0);
+    wy = view.y1 - (y / (double)winH) * (view.y1 - view.y0);
+}
+
+// ====== CALLBACKS ======
+
 void reshape(int w, int h) {
-    windowWidth = w;
-    windowHeight = h;
+    winW = w; winH = h;
     glViewport(0, 0, w, h);
-    calcCamera();
     glutPostRedisplay();
 }
 
 void keyboard(unsigned char key, int x, int y) {
     switch (key) {
-    case 'w': cameraPos.y += 1.0; break;
-    case 's': cameraPos.y -= 1.0; break;
-    case 'a': cameraPos.x -= 1.0; break;
-    case 'd': cameraPos.x += 1.0; break;
-    case 'q': cameraSize.y *= 1.2; break;
-    case 'e': cameraSize.y *= 0.8; break;
-    case 'z': points.clear(); break;
-    default: return;
+        case '1': paramMode = UNIFORM; dirty = true; break;
+        case '2': paramMode = CHORD; dirty = true; break;
+        case '3': paramMode = CENTRIPETAL; dirty = true; break;
+        case '4': splineMode = NATURAL; dirty = true; break;
+        case '5': splineMode = CLAMPED; dirty = true; break;
+        case 'c': case 'C': points.clear(); dirty = true; activePoint = hoverPoint = -1; break;
+        case 'r': case 'R': view = {-6.0, 6.0, -4.5, 4.5}; break;
+        case '+': case '=': {
+            double cx = (view.x0 + view.x1) * 0.5;
+            double cy = (view.y0 + view.y1) * 0.5;
+            view.x0 = cx + (view.x0 - cx) * 0.82;
+            view.x1 = cx + (view.x1 - cx) * 0.82;
+            view.y0 = cy + (view.y0 - cy) * 0.82;
+            view.y1 = cy + (view.y1 - cy) * 0.82;
+        } break;
+        case '-': case '_': {
+            double cx = (view.x0 + view.x1) * 0.5;
+            double cy = (view.y0 + view.y1) * 0.5;
+            view.x0 = cx + (view.x0 - cx) * 1.22;
+            view.x1 = cx + (view.x1 - cx) * 1.22;
+            view.y0 = cy + (view.y0 - cy) * 1.22;
+            view.y1 = cy + (view.y1 - cy) * 1.22;
+        } break;
+        case 27: case 'q': case 'Q': exit(0);
+        default: return;
     }
-    calcCamera();
     glutPostRedisplay();
 }
 
-void mouse(int button, int state, int x, int y) {
-    updateMouseWorld(x, y);
-    if (button == GLUT_LEFT_BUTTON && state == GLUT_DOWN) {
-        for (size_t i = 0; i < points.size(); ++i) {
-            if (canGrab(points[i])) {
-                moving_point = (int)i;
-                return;
-            }
-        }
-        bool tooClose = false;
-        for (const auto& p : points) {
-            if (!canAdd(p, mouseWorld)) {
-                tooClose = true;
+void mouse(int btn, int state, int x, int y) {
+    screenToWorld(x, y, mx, my);
+    
+    if (btn == GLUT_LEFT_BUTTON && state == GLUT_DOWN) {
+        activePoint = -1;
+        for (int i = (int)points.size() - 1; i >= 0; --i) {
+            if (canGrab(points[i], mx, my)) {
+                activePoint = i;
                 break;
             }
         }
-        if (!tooClose) {
-            points.push_back(mouseWorld);
-            std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-                return a.x < b.x;
-                });
+        if (activePoint == -1) {
+            points.push_back({mx, my});
+            activePoint = (int)points.size() - 1;
+            dirty = true;
         }
-    }
-    else if (button == GLUT_LEFT_BUTTON && state == GLUT_UP) {
-        moving_point = -1;
-    }
-    else if (button == GLUT_MIDDLE_BUTTON && state == GLUT_DOWN) {
+        mouseDown = true;
+    } else if (btn == GLUT_LEFT_BUTTON && state == GLUT_UP) {
+        mouseDown = false;
+        activePoint = -1;
+    } else if (btn == GLUT_RIGHT_BUTTON && state == GLUT_DOWN) {
         for (size_t i = 0; i < points.size(); ++i) {
-            if (canGrab(points[i])) {
+            if (canGrab(points[i], mx, my)) {
                 points.erase(points.begin() + i);
+                dirty = true;
                 break;
             }
         }
@@ -265,177 +321,83 @@ void mouse(int button, int state, int x, int y) {
 }
 
 void motion(int x, int y) {
-    updateMouseWorld(x, y);
-    if (moving_point != -1 && moving_point < (int)points.size()) {
-        bool conflict = false;
-        for (size_t i = 0; i < points.size(); ++i) {
-            if ((int)i == moving_point) continue;
-            if (!canAdd(points[i], mouseWorld)) {
-                conflict = true;
-                break;
-            }
-        }
-        if (!conflict) {
-            points[moving_point] = mouseWorld;
-            if (moving_point > 0 && points[moving_point].x < points[moving_point - 1].x) {
-                std::swap(points[moving_point], points[moving_point - 1]);
-                moving_point--;
-            }
-            else if (moving_point < (int)points.size() - 1 && points[moving_point].x > points[moving_point + 1].x) {
-                std::swap(points[moving_point], points[moving_point + 1]);
-                moving_point++;
-            }
-        }
+    screenToWorld(x, y, mx, my);
+    
+    if (mouseDown && activePoint >= 0 && activePoint < (int)points.size()) {
+        points[activePoint].x = mx;
+        points[activePoint].y = my;
+        dirty = true;
     }
-    glutPostRedisplay();
-}
-
-void passiveMotion(int x, int y) {
-    updateMouseWorld(x, y);
-    int new_hover = -1;
-    for (size_t i = 0; i < points.size(); ++i) {
-        if (canGrab(points[i])) {
-            new_hover = (int)i;
+    
+    int newHover = -1;
+    for (int i = (int)points.size() - 1; i >= 0; --i) {
+        if (canGrab(points[i], mx, my)) {
+            newHover = i;
             break;
         }
     }
-    if (new_hover != hover_point) {
-        hover_point = new_hover;
+    if (newHover != hoverPoint) {
+        hoverPoint = newHover;
+        glutPostRedisplay();
+    } else if (dirty) {
         glutPostRedisplay();
     }
 }
 
 void display() {
     glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    // Оси и сетка
-    glColor3f(0.0f, 0.0f, 0.0f);
-    glLineWidth(2.0f);
-    glBegin(GL_LINES);
-    glVertex2d(cameraPos.x - cameraSize.x, 0.0);
-    glVertex2d(cameraPos.x + cameraSize.x, 0.0);
-    glVertex2d(0.0, cameraPos.y - cameraSize.y);
-    glVertex2d(0.0, cameraPos.y + cameraSize.y);
-    glEnd();
-
-    glColor3f(0.8f, 0.8f, 0.8f);
-    glLineWidth(1.0f);
-    glBegin(GL_LINES);
-    double from_x = std::floor((cameraPos.x - cameraSize.x) / label_step) * label_step;
-    double to_x = std::ceil((cameraPos.x + cameraSize.x) / label_step) * label_step;
-    for (double x = from_x; x <= to_x; x += label_step) {
-        glVertex2d(x, cameraPos.y - cameraSize.y);
-        glVertex2d(x, cameraPos.y + cameraSize.y);
-    }
-    double from_y = std::floor((cameraPos.y - cameraSize.y) / label_step) * label_step;
-    double to_y = std::ceil((cameraPos.y + cameraSize.y) / label_step) * label_step;
-    for (double y = from_y; y <= to_y; y += label_step) {
-        glVertex2d(cameraPos.x - cameraSize.x, y);
-        glVertex2d(cameraPos.x + cameraSize.x, y);
-    }
-    glEnd();
-
-    // Подписи
-    glColor3f(0.0f, 0.0f, 0.0f);
-    from_x = std::floor((cameraPos.x - cameraSize.x) / label_step) * label_step;
-    to_x = std::ceil((cameraPos.x + cameraSize.x) / label_step) * label_step;
-    for (double x = from_x; x <= to_x; x += label_step) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.1f", std::abs(x) < 0.1 ? 0.0 : x);
-        renderText(x, 0.0, LABEL_BASE_HEIGHT, buf);
-    }
-    from_y = std::floor((cameraPos.y - cameraSize.y) / label_step) * label_step;
-    to_y = std::ceil((cameraPos.y + cameraSize.y) / label_step) * label_step;
-    for (double y = from_y; y <= to_y; y += label_step) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.1f", std::abs(y) < 0.1 ? 0.0 : y);
-        renderText(0.0, y, LABEL_BASE_HEIGHT, buf);
-    }
-
-    // Точки
-    glPointSize(8.0f);
-    glBegin(GL_POINTS);
-    for (size_t i = 0; i < points.size(); ++i) {
-        if ((int)i == hover_point) {
-            glColor3f(0.7f, 0.2f, 0.2f);
-        }
-        else {
-            glColor3f(1.0f, 0.2f, 0.2f);
-        }
-        glVertex2d(points[i].x, points[i].y);
-    }
-    glEnd();
-
-    // Сплайн и производная
-    if ((int)points.size() >= MIN_POINTS) {
-        // Сплайн (красный)
-        glColor3f(1.0f, 0.2f, 0.2f);
-        glBegin(GL_LINE_STRIP);
-        for (int seg = 0; seg <= (int)points.size() - 4; ++seg) {
-            std::array<Point, 4> quad = { points[seg], points[seg + 1], points[seg + 2], points[seg + 3] };
-            double x_start = quad[1].x;
-            double x_end = quad[2].x;
-            int steps = std::max(1, (int)((x_end - x_start) / step));
-            for (int i = 0; i <= steps; ++i) {
-                double t = x_start + (x_end - x_start) * i / steps;
-                double y = lagrange3(t, quad);
-                glVertex2d(t, y);
-            }
-        }
-        glEnd();
-
-        // Производная (синий)
-        glColor3f(0.0f, 0.0f, 1.0f);
-        glBegin(GL_LINE_STRIP);
-        for (int seg = 0; seg <= (int)points.size() - 4; ++seg) {
-            std::array<Point, 4> quad = { points[seg], points[seg + 1], points[seg + 2], points[seg + 3] };
-            double x_start = quad[1].x;
-            double x_end = quad[2].x;
-            int steps = std::max(1, (int)((x_end - x_start) / step));
-            for (int i = 0; i <= steps; ++i) {
-                double t = x_start + (x_end - x_start) * i / steps;
-                double y = lagrange3Derivative(t, quad);
-                glVertex2d(t, y);
-            }
-        }
-        glEnd();
-    }
-    else {
-        // Ломаная
-        glColor3f(1.0f, 0.2f, 0.2f);
-        glBegin(GL_LINE_STRIP);
-        for (const auto& p : points) {
-            glVertex2d(p.x, p.y);
-        }
-        glEnd();
-    }
-
-    glFinish();
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(view.x0, view.x1, view.y0, view.y1, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    
+    drawGrid();
+    drawSpline();
+    drawPoints();
+    
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, winW, 0, winH, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    
+    drawUI();
+    
     glutSwapBuffers();
-    updateWindowTitle();
+    
+    char title[80];
+    snprintf(title, sizeof(title), "1D Parametric Splines — %s — %s",
+             paramNames[(int)paramMode], splineNames[(int)splineMode]);
+    glutSetWindowTitle(title);
 }
 
-// ====== Main ======
+// ====== MAIN ======
 int main(int argc, char** argv) {
+    points = { {-4,-2}, {-2,3}, {0,-1}, {2,2}, {4,-2} };
+    dirty = true;
+    
     glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
-    glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("КГ Лаб 4");
-
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(winW, winH);
+    glutCreateWindow("1D Parametric Splines — Parameterization Modes");
+    
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_POINT_SMOOTH);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    
     glutReshapeFunc(reshape);
     glutDisplayFunc(display);
     glutKeyboardFunc(keyboard);
     glutMouseFunc(mouse);
     glutMotionFunc(motion);
-    glutPassiveMotionFunc(passiveMotion);
-
-    createMenu();
-
-    glEnable(GL_POINT_SMOOTH);
-    glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
-
-    calcCamera();
+    glutPassiveMotionFunc(motion);
+    
     glutMainLoop();
     return 0;
 }
