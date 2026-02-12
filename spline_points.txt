@@ -1,0 +1,13 @@
+# 1D Parametric Spline Points
+# Format: x y
+# Parameterization: Chord Length
+# Boundary: Closed Curve (Periodic)
+# Points: 7
+
+-5 -1.5
+-3.5 3
+-1.5 -2.5
+0.413636 -3.04
+2 -2.2
+4 2
+5.5 -0.5
